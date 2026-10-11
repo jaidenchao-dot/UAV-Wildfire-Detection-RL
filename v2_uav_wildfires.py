@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""V2 UAV WILDFIRES - Multi-Drone Selection & Thermal Reward Shaping"""
+"""V2 UAV WILDFIRES - Multi-Drone Selection & Episode Config"""
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -8,7 +8,7 @@ import math
 import random
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Button
+from matplotlib.widgets import Button, TextBox
 from collections import namedtuple, deque
 from itertools import count
 import torch
@@ -21,71 +21,92 @@ import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 import shapely.affinity
 
-# --- CUSTOM GRAPHICAL DRONE SELECTION SCREEN ---
+# --- CUSTOM GRAPHICAL CONFIGURATION SCREEN ---
 def select_drone_model():
-    # Ensure interactive mode is OFF so plt.show() blocks execution and waits for user input
     plt.ioff()
-    
-    fig, ax = plt.subplots(figsize=(9, 5.5))
-    plt.subplots_adjust(bottom=0.25)
-    ax.set_title("UAV Wildfire Patrol: Select Drone Model", fontsize=14, fontweight='bold', pad=15)
+    fig, ax = plt.subplots(figsize=(9, 6.2))
+    plt.subplots_adjust(bottom=0.32)
+    ax.set_title("UAV Wildfire Patrol: Configuration Setup", fontsize=14, fontweight='bold', pad=15)
     ax.axis('off')
     
     desc_text = (
-        "Please select a drone model to configure its performance specs:\n\n"
-        "  • Heavy Duty\n"
-        "    Best for small area patrol as it can scan larger areas.\n"
-        "    (Max Steps: 30 | Discovery Radius: 10 units)\n\n"
-        "  • All-In-One\n"
-        "    Balances distance travel with sensor range.\n"
-        "    (Max Steps: 50 | Discovery Radius: 5 units)\n\n"
-        "  • Explorer\n"
-        "    Maximize distance over sensor range.\n"
-        "    (Max Steps: 100 | Discovery Radius: 2 units)"
+        "1. Select a drone model:\n"
+        "  • Heavy Duty (Max Steps: 30 | Radius: 10 units)\n"
+        "  • All-In-One (Max Steps: 50 | Radius: 5 units)\n"
+        "  • Explorer (Max Steps: 100 | Radius: 2 units)\n\n"
+        "2. Enter number of training episodes (300 to 6000):"
     )
-    ax.text(0.05, 0.55, desc_text, fontsize=10.5, family='sans-serif', verticalalignment='center')
+    ax.text(0.05, 0.65, desc_text, fontsize=10.5, family='sans-serif', verticalalignment='center')
     
     selected_config = {}
     
-    # Buttons for selection
-    ax_btn1 = plt.axes([0.08, 0.08, 0.25, 0.1])
-    ax_btn2 = plt.axes([0.37, 0.08, 0.25, 0.1])
-    ax_btn3 = plt.axes([0.66, 0.08, 0.25, 0.1])
+    # Text box for episodes input
+    ax_box = plt.axes([0.28, 0.38, 0.44, 0.07])
+    text_box = TextBox(ax_box, 'Episodes: ', initial='300')
+    
+    # Buttons for drone selection
+    ax_btn1 = plt.axes([0.08, 0.12, 0.25, 0.1])
+    ax_btn2 = plt.axes([0.37, 0.12, 0.25, 0.1])
+    ax_btn3 = plt.axes([0.66, 0.12, 0.25, 0.1])
     
     btn1 = Button(ax_btn1, 'Heavy Duty', color='lightblue', hovercolor='skyblue')
     btn2 = Button(ax_btn2, 'All-In-One', color='lightgreen', hovercolor='limegreen')
     btn3 = Button(ax_btn3, 'Explorer', color='lightyellow', hovercolor='khaki')
     
+    def get_episodes():
+        try:
+            val = int(text_box.text)
+            return max(300, min(6000, val))
+        except ValueError:
+            return 300
+            
     def set_heavy(event):
-        selected_config.update({'name': 'Heavy Duty', 'max_steps': 30, 'discovery_radius': 10})
+        selected_config.update({
+            'name': 'Heavy Duty', 
+            'max_steps': 30, 
+            'discovery_radius': 10,
+            'num_episodes': get_episodes()
+        })
         plt.close(fig)
         
     def set_all(event):
-        selected_config.update({'name': 'All-In-One', 'max_steps': 50, 'discovery_radius': 5})
+        selected_config.update({
+            'name': 'All-In-One', 
+            'max_steps': 50, 
+            'discovery_radius': 5,
+            'num_episodes': get_episodes()
+        })
         plt.close(fig)
         
     def set_explorer(event):
-        selected_config.update({'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2})
+        selected_config.update({
+            'name': 'Explorer', 
+            'max_steps': 100, 
+            'discovery_radius': 2,
+            'num_episodes': get_episodes()
+        })
         plt.close(fig)
         
     btn1.on_clicked(set_heavy)
     btn2.on_clicked(set_all)
     btn3.on_clicked(set_explorer)
     
-    # Explicitly block execution until a button is clicked and the window closes
     plt.show(block=True)
     
-    # Fallback if window was closed without clicking
     if not selected_config:
-        selected_config.update({'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2})
+        selected_config.update({
+            'name': 'Explorer', 
+            'max_steps': 100, 
+            'discovery_radius': 2,
+            'num_episodes': 300
+        })
         
-    print(f"Selected Drone Model: {selected_config['name']} (Max Steps: {selected_config['max_steps']}, Radius: {selected_config['discovery_radius']})")
+    print(f"Configuration Selected -> Drone: {selected_config['name']} | Max Steps: {selected_config['max_steps']} | Radius: {selected_config['discovery_radius']} | Episodes: {selected_config['num_episodes']}")
     
-    # Turn interactive mode back on for training visualization plots
     plt.ion()
     return selected_config
 
-# Launch selection screen before initializing environment (now properly blocking)
+# Launch configuration window before initializing environment
 drone_spec = select_drone_model()
 
 # set up matplotlib for training
@@ -121,21 +142,21 @@ class AreaDiscoveryEnv(gym.Env):
         self.grid_x = 250
         self.grid_y = 100
 
-        # Ranger Stations: Main station at index 0, followed by the 6 custom stations
+        # Ranger Stations: Main station at index 0, followed by the 6 custom stations[cite: 3]
         self.stations = [
-            np.array([135.0, 45.0], dtype=np.float32),  # Main Home Center Station
-            np.array([124.0, 83.0], dtype=np.float32),  # Station 1
-            np.array([182.0, 54.0], dtype=np.float32),  # Station 2
-            np.array([135.0, 18.0], dtype=np.float32),  # Station 3
-            np.array([90.0, 39.0], dtype=np.float32),   # Station 4
-            np.array([42.0, 50.0], dtype=np.float32),   # Station 5
-            np.array([96.0, 6.0], dtype=np.float32)     # Station 6
+            np.array([135.0, 45.0], dtype=np.float32),  # Main Home Center Station[cite: 3]
+            np.array([124.0, 83.0], dtype=np.float32),  # Station 1[cite: 3]
+            np.array([182.0, 54.0], dtype=np.float32),  # Station 2[cite: 3]
+            np.array([135.0, 18.0], dtype=np.float32),  # Station 3[cite: 3]
+            np.array([90.0, 39.0], dtype=np.float32),   # Station 4[cite: 3]
+            np.array([42.0, 50.0], dtype=np.float32),   # Station 5[cite: 3]
+            np.array([96.0, 6.0], dtype=np.float32)     # Station 6[cite: 3]
         ]
 
-        # Drone starts at the main home center station (index 0)
+        # Drone starts at the main home center station (index 0)[cite: 3]
         self.start_pos = self.stations[0]
 
-        # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid
+        # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid[cite: 1, 3]
         print("Loading and scaling shapefile boundary...")
         boundary_file = "samo_tracts/samo_boundary.shp"
         park_boundary_gdf = gpd.read_file(boundary_file)
@@ -245,7 +266,7 @@ class AreaDiscoveryEnv(gym.Env):
         self.steps += 1
         self.trajectory.append(self.pos.copy())
 
-        # Automatically scale battery drain to use 100% capacity over the specified max steps
+        # Automatically scale battery drain to use 100% capacity over the specified max steps[cite: 3]
         self.battery -= (100.0 / self.max_steps)
 
         reward = 1.0
@@ -257,7 +278,7 @@ class AreaDiscoveryEnv(gym.Env):
             if not np.isnan(val):
                 current_temp = val
 
-        # Thermal reward shaping
+        # Thermal reward shaping[cite: 3]
         reward += (current_temp / 20.0)
 
         if not self.fire_scouted:
@@ -280,11 +301,11 @@ class AreaDiscoveryEnv(gym.Env):
             if min_dist_to_station <= 9.0:
                 closest_station_idx = np.argmin(distances)
                 if closest_station_idx == 0:
-                    reward += 150.0  # Home Station reward
+                    reward += 150.0  # Home Station reward[cite: 3]
                 else:
-                    reward += 250.0  # Station reward
+                    reward += 250.0  # Station reward[cite: 3]
             else:
-                reward -= 100.0  # Stranded penalty
+                reward -= 100.0  # Stranded penalty[cite: 3]
 
         return self._get_obs(), reward, terminated, truncated, {}
 
@@ -432,7 +453,8 @@ def optimize_model():
     torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
     optimizer.step()
 
-num_episodes = 6000 if torch.cuda.is_available() else 300
+# Use the number of episodes specified by the user in the configuration window
+num_episodes = drone_spec['num_episodes']
 
 for i_episode in range(num_episodes):
     state, info = env.reset()
