@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""V2 UAV WILDFIRES - Shapefile Integrated"""
+"""V2 UAV WILDFIRES - Shapefile Integrated with Thermal Reward Shaping"""
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -51,7 +51,7 @@ class AreaDiscoveryEnv(gym.Env):
         self.grid_x = 250
         self.grid_y = 100
 
-        # Ranger Stations: Index 0 is Main Home Center, Indices 1-6 are the new stations
+        # Ranger Stations: Main station at index 0, followed by the 6 custom stations
         self.stations = [
             np.array([135.0, 45.0], dtype=np.float32),  # Main Home Center Station
             np.array([124.0, 83.0], dtype=np.float32),  # Station 1
@@ -188,7 +188,18 @@ class AreaDiscoveryEnv(gym.Env):
 
         self.battery -= (100.0 / self.max_steps)
 
-        reward = 1
+        reward = 1.0
+
+        # Read thermal sensor at current position for reward shaping
+        x, y = int(self.pos[0]), int(self.pos[1])
+        current_temp = 50.0
+        if 0 <= x < self.grid_x and 0 <= y < self.grid_y and self.valid_mask[x, y]:
+            val = self.temperature_grid[x, y]
+            if not np.isnan(val):
+                current_temp = val
+
+        # THERMAL REWARD SHAPING: Guide the agent toward heat hotspots where fires occur
+        reward += (current_temp / 20.0)
 
         # Check if drone scouted the wildfire within discovery range (+10,000 score booster)
         if not self.fire_scouted:
