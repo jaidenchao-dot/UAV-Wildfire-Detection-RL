@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""V2 UAV WILDFIRES - Shapefile Integrated with Thermal Reward Shaping"""
+"""V2 UAV WILDFIRES - Multi-Drone Selection & Thermal Reward Shaping"""
 
 import gymnasium as gym
 from gymnasium import spaces
@@ -8,6 +8,7 @@ import math
 import random
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Button
 from collections import namedtuple, deque
 from itertools import count
 import torch
@@ -20,7 +21,74 @@ import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 import shapely.affinity
 
-# set up matplotlib
+# --- CUSTOM GRAPHICAL DRONE SELECTION SCREEN ---
+def select_drone_model():
+    # Ensure interactive mode is OFF so plt.show() blocks execution and waits for user input
+    plt.ioff()
+    
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    plt.subplots_adjust(bottom=0.25)
+    ax.set_title("UAV Wildfire Patrol: Select Drone Model", fontsize=14, fontweight='bold', pad=15)
+    ax.axis('off')
+    
+    desc_text = (
+        "Please select a drone model to configure its performance specs:\n\n"
+        "  • Heavy Duty\n"
+        "    Best for small area patrol as it can scan larger areas.\n"
+        "    (Max Steps: 30 | Discovery Radius: 10 units)\n\n"
+        "  • All-In-One\n"
+        "    Balances distance travel with sensor range.\n"
+        "    (Max Steps: 50 | Discovery Radius: 5 units)\n\n"
+        "  • Explorer\n"
+        "    Maximize distance over sensor range.\n"
+        "    (Max Steps: 100 | Discovery Radius: 2 units)"
+    )
+    ax.text(0.05, 0.55, desc_text, fontsize=10.5, family='sans-serif', verticalalignment='center')
+    
+    selected_config = {}
+    
+    # Buttons for selection
+    ax_btn1 = plt.axes([0.08, 0.08, 0.25, 0.1])
+    ax_btn2 = plt.axes([0.37, 0.08, 0.25, 0.1])
+    ax_btn3 = plt.axes([0.66, 0.08, 0.25, 0.1])
+    
+    btn1 = Button(ax_btn1, 'Heavy Duty', color='lightblue', hovercolor='skyblue')
+    btn2 = Button(ax_btn2, 'All-In-One', color='lightgreen', hovercolor='limegreen')
+    btn3 = Button(ax_btn3, 'Explorer', color='lightyellow', hovercolor='khaki')
+    
+    def set_heavy(event):
+        selected_config.update({'name': 'Heavy Duty', 'max_steps': 30, 'discovery_radius': 10})
+        plt.close(fig)
+        
+    def set_all(event):
+        selected_config.update({'name': 'All-In-One', 'max_steps': 50, 'discovery_radius': 5})
+        plt.close(fig)
+        
+    def set_explorer(event):
+        selected_config.update({'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2})
+        plt.close(fig)
+        
+    btn1.on_clicked(set_heavy)
+    btn2.on_clicked(set_all)
+    btn3.on_clicked(set_explorer)
+    
+    # Explicitly block execution until a button is clicked and the window closes
+    plt.show(block=True)
+    
+    # Fallback if window was closed without clicking
+    if not selected_config:
+        selected_config.update({'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2})
+        
+    print(f"Selected Drone Model: {selected_config['name']} (Max Steps: {selected_config['max_steps']}, Radius: {selected_config['discovery_radius']})")
+    
+    # Turn interactive mode back on for training visualization plots
+    plt.ion()
+    return selected_config
+
+# Launch selection screen before initializing environment (now properly blocking)
+drone_spec = select_drone_model()
+
+# set up matplotlib for training
 is_ipython = 'inline' in matplotlib.get_backend()
 if is_ipython:
     from IPython import display
@@ -35,19 +103,21 @@ device = torch.device(
 )
 
 class AreaDiscoveryEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
         self.action_space = spaces.Discrete(9)
+        
+        self.drone_name = config['name']
+        self.max_steps = config['max_steps']
+        self.discovery_radius = config['discovery_radius']
 
-        # Real-world scaled observation bounds:
-        # X: -250 to 250, Y: -100 to 100, steps, battery, temperature (0-100)
+        # Real-world scaled observation bounds with dynamic max steps
         self.observation_space = spaces.Box(
             low=np.array([-250.0, -100.0, 0, 0.0, 0.0]),
-            high=np.array([250.0, 100.0, 35, 100.0, 100.0]),
+            high=np.array([250.0, 100.0, float(self.max_steps), 100.0, 100.0]),
             dtype=np.float32
         )
 
-        self.max_steps = 35
         self.grid_x = 250
         self.grid_y = 100
 
@@ -65,25 +135,19 @@ class AreaDiscoveryEnv(gym.Env):
         # Drone starts at the main home center station (index 0)
         self.start_pos = self.stations[0]
 
-        # Discovery radius scaled to real life (~0.32 miles / ~1,700 ft per step scan width)
-        self.discovery_radius = 2
-
         # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid
         print("Loading and scaling shapefile boundary...")
         boundary_file = "samo_tracts/samo_boundary.shp"
         park_boundary_gdf = gpd.read_file(boundary_file)
         raw_polygon = park_boundary_gdf.geometry.unary_union
         
-        # Determine the scale required to map the coordinates to 250x100
         minx, miny, maxx, maxy = raw_polygon.bounds
         scale_x = self.grid_x / (maxx - minx)
         scale_y = self.grid_y / (maxy - miny)
         
-        # Translate to origin (0,0) and scale up to grid dimensions
         translated_poly = shapely.affinity.translate(raw_polygon, xoff=-minx, yoff=-miny)
         self.boundary_polygon = shapely.affinity.scale(translated_poly, xfact=scale_x, yfact=scale_y, origin=(0, 0))
 
-        # Full map mask spanning 250x100 generated from the loaded polygon
         self.valid_mask = np.zeros((self.grid_x, self.grid_y), dtype=bool)
         for i in range(self.grid_x):
             for j in range(self.grid_y):
@@ -95,7 +159,6 @@ class AreaDiscoveryEnv(gym.Env):
         self.fire_scouted = False
 
     def _generate_scenario(self):
-        # Generate smooth random temperature map spanning across the full 250x100 space
         self.temperature_grid = np.zeros((self.grid_x, self.grid_y), dtype=np.float32)
         num_hotspots = random.randint(5, 9)
         valid_indices = np.argwhere(self.valid_mask)
@@ -116,7 +179,6 @@ class AreaDiscoveryEnv(gym.Env):
 
         self.temperature_grid[~self.valid_mask] = np.nan
 
-        # Generate fire location near a super hot location (temperature >= 75.0)
         hot_mask = (self.temperature_grid >= 75.0) & self.valid_mask
         hot_indices = np.argwhere(hot_mask)
 
@@ -133,7 +195,6 @@ class AreaDiscoveryEnv(gym.Env):
         self.steps = 0
         self.battery = 100.0
 
-        # Generate new temperature layout and fire location for this run
         self._generate_scenario()
 
         self.visited = ~self.valid_mask.copy()
@@ -148,7 +209,6 @@ class AreaDiscoveryEnv(gym.Env):
         dist_y = closest_station[1] - self.pos[1]
         steps_left = self.max_steps - self.steps
 
-        # Read thermal sensor at the drone's current grid position
         x, y = int(self.pos[0]), int(self.pos[1])
         if 0 <= x < self.grid_x and 0 <= y < self.grid_y and self.valid_mask[x, y]:
             current_temp = self.temperature_grid[x, y]
@@ -178,7 +238,6 @@ class AreaDiscoveryEnv(gym.Env):
         proposed_x = self.pos[0] + dx
         proposed_y = self.pos[1] + dy
 
-        # Ensure bounds mapping remains inside the actual shapefile polygon rules
         if self.boundary_polygon.contains(Point(proposed_x, proposed_y)):
             self.pos[0] = proposed_x
             self.pos[1] = proposed_y
@@ -186,11 +245,11 @@ class AreaDiscoveryEnv(gym.Env):
         self.steps += 1
         self.trajectory.append(self.pos.copy())
 
+        # Automatically scale battery drain to use 100% capacity over the specified max steps
         self.battery -= (100.0 / self.max_steps)
 
         reward = 1.0
 
-        # Read thermal sensor at current position for reward shaping
         x, y = int(self.pos[0]), int(self.pos[1])
         current_temp = 50.0
         if 0 <= x < self.grid_x and 0 <= y < self.grid_y and self.valid_mask[x, y]:
@@ -198,10 +257,9 @@ class AreaDiscoveryEnv(gym.Env):
             if not np.isnan(val):
                 current_temp = val
 
-        # THERMAL REWARD SHAPING: Guide the agent toward heat hotspots where fires occur
+        # Thermal reward shaping
         reward += (current_temp / 20.0)
 
-        # Check if drone scouted the wildfire within discovery range (+10,000 score booster)
         if not self.fire_scouted:
             dist_to_fire = np.linalg.norm(self.pos - self.fire_pos)
             if dist_to_fire <= self.discovery_radius:
@@ -224,7 +282,7 @@ class AreaDiscoveryEnv(gym.Env):
                 if closest_station_idx == 0:
                     reward += 150.0  # Home Station reward
                 else:
-                    reward += 250.0  # Increased reward for reaching other stations
+                    reward += 250.0  # Station reward
             else:
                 reward -= 100.0  # Stranded penalty
 
@@ -265,7 +323,7 @@ EPS_DECAY = 10000
 TAU = 0.005
 LR = 1e-3
 
-env = AreaDiscoveryEnv()
+env = AreaDiscoveryEnv(drone_spec)
 n_actions = env.action_space.n
 state, info = env.reset()
 n_observations = len(state)
@@ -277,7 +335,7 @@ target_net.load_state_dict(policy_net.state_dict())
 optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
 memory = ReplayMemory(10000)
 steps_done = 0
-all_trajectories = [] # To store paths for visualization
+all_trajectories = [] 
 episode_rewards = []
 
 def select_action(state):
@@ -291,8 +349,6 @@ def select_action(state):
     else:
         return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
 
-import matplotlib.patches as patches
-
 def plot_trajectories(show_result=False):
     plt.figure(figsize=(10, 4.5))
     plt.clf()
@@ -301,7 +357,6 @@ def plot_trajectories(show_result=False):
     plt.ylim(0, 100)
     plt.gca().set_aspect('equal', adjustable='box')
 
-    # Plot Temperature Grid Heatmap across the full 250x100 grid bounds
     plt.imshow(
         env.temperature_grid.T,
         origin='lower',
@@ -313,7 +368,6 @@ def plot_trajectories(show_result=False):
         zorder=1
     )
 
-    # Plot Mountain Boundary natively rendering shapefile bounds
     if isinstance(env.boundary_polygon, Polygon):
         x, y = env.boundary_polygon.exterior.xy
         plt.plot(x, y, 'k-', linewidth=2, label="Mountain Boundary", zorder=2)
@@ -323,10 +377,8 @@ def plot_trajectories(show_result=False):
             label = "Mountain Boundary" if idx == 0 else ""
             plt.plot(x, y, 'k-', linewidth=2, label=label, zorder=2)
 
-    # Plot Wildfire Location Marker
     plt.scatter([env.fire_pos[0]], [env.fire_pos[1]], color='darkred', marker='*', s=250, zorder=6, label="Wildfire Location")
 
-    # Plot ALL Ranger Stations on the map distinctly
     for idx, station in enumerate(env.stations):
         if idx == 0:
             plt.scatter([station[0]], [station[1]], color='red', s=100, zorder=5, label="Main Home Station")
@@ -343,7 +395,7 @@ def plot_trajectories(show_result=False):
 
     plt.xlabel("East-West Distance Units (~0.16 miles / unit)", fontsize=10)
     plt.ylabel("North-South Distance Units (~0.16 miles / unit)", fontsize=10)
-    plt.title('Santa Monica Mountains Wildfire Patrol & Thermal Scans', fontsize=12)
+    plt.title(f'Santa Monica Mountains Patrol ({drone_spec["name"]} - Radius: {drone_spec["discovery_radius"]})', fontsize=12)
 
     plt.legend(loc='upper right', fontsize=8)
     plt.grid(True, linestyle='--', alpha=0.3)
@@ -404,7 +456,6 @@ for i_episode in range(num_episodes):
 
         optimize_model()
 
-        # Soft update target network
         target_net_state_dict = target_net.state_dict()
         policy_net_state_dict = policy_net.state_dict()
         for key in policy_net_state_dict:
@@ -415,7 +466,6 @@ for i_episode in range(num_episodes):
             all_trajectories.append(env.trajectory)
             episode_rewards.append(ep_reward)
 
-            # Update visualization every 20 episodes to save rendering time
             if (i_episode + 1) % 20 == 0:
                 plot_trajectories()
             break
@@ -425,10 +475,9 @@ plot_trajectories(show_result=True)
 plt.ioff()
 plt.show()
 
-# Optional: Plot the learning curve
 plt.figure(2)
 plt.plot(episode_rewards)
-plt.title('Reward over Time')
+plt.title(f'Reward over Time ({drone_spec["name"]})')
 plt.xlabel('Episode')
 plt.ylabel('Total Reward')
 plt.show()
