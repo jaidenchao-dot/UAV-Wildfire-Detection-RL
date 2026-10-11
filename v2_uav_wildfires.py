@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """V2 UAV WILDFIRES - Multi-Drone Selection & Episode Config"""
 
+import argparse
+import os
+import shutil
+from pathlib import Path
+
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
@@ -20,6 +25,24 @@ import torch.nn.functional as F
 import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 import shapely.affinity
+
+# --- COMMAND-LINE ARGUMENT & OUTPUT FOLDER SETUP ---
+parser = argparse.ArgumentParser(description="UAV Wildfire Patrol Training Simulation")
+parser.add_argument("-o", "--output_folder", type=str, default = "photos", help="Local folder name to save output figures")
+parser.add_argument("-d", "--drone", type=str, choices=["Heavy Duty", "All-In-One", "Explorer"], default="All-In-One", help="Selected drone model")
+parser.add_argument("-e", "--episodes", type=int, default=300, help="Number of training episodes")
+args = parser.parse_args()
+
+output_dir = Path(args.output_folder)
+if output_dir.exists():
+    # Clear existing files inside the folder
+    for item in output_dir.iterdir():
+        if item.is_file():
+            item.unlink()
+        elif item.is_dir():
+            shutil.rmtree(item)
+else:
+    output_dir.mkdir(parents=True, exist_ok=True)
 
 # --- CUSTOM GRAPHICAL CONFIGURATION SCREEN ---
 def select_drone_model():
@@ -91,7 +114,8 @@ def select_drone_model():
     btn2.on_clicked(set_all)
     btn3.on_clicked(set_explorer)
     
-    plt.show(block=True)
+    plt.savefig(output_dir / "config_setup.png", bbox_inches='tight')
+    # plt.show(block=True)
     
     if not selected_config:
         selected_config.update({
@@ -106,8 +130,19 @@ def select_drone_model():
     plt.ion()
     return selected_config
 
-# Launch configuration window before initializing environment
-drone_spec = select_drone_model()
+
+# Launch configuration (via Streamlit command-line flags or fallback to interactive GUI)
+if args.drone and args.episodes:
+    specs = {
+        'Heavy Duty': {'name': 'Heavy Duty', 'max_steps': 30, 'discovery_radius': 10},
+        'All-In-One': {'name': 'All-In-One', 'max_steps': 50, 'discovery_radius': 5},
+        'Explorer': {'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2}
+    }
+    drone_spec = specs[args.drone]
+    drone_spec['num_episodes'] = max(300, min(6000, args.episodes))
+    print(f"Configuration Loaded -> Drone: {drone_spec['name']} | Max Steps: {drone_spec['max_steps']} | Radius: {drone_spec['discovery_radius']} | Episodes: {drone_spec['num_episodes']}")
+else:
+    drone_spec = select_drone_model()
 
 # set up matplotlib for training
 is_ipython = 'inline' in matplotlib.get_backend()
@@ -142,21 +177,21 @@ class AreaDiscoveryEnv(gym.Env):
         self.grid_x = 250
         self.grid_y = 100
 
-        # Ranger Stations: Main station at index 0, followed by the 6 custom stations[cite: 3]
+        # Ranger Stations: Main station at index 0, followed by the 6 custom stations
         self.stations = [
-            np.array([135.0, 45.0], dtype=np.float32),  # Main Home Center Station[cite: 3]
-            np.array([124.0, 83.0], dtype=np.float32),  # Station 1[cite: 3]
-            np.array([182.0, 54.0], dtype=np.float32),  # Station 2[cite: 3]
-            np.array([135.0, 18.0], dtype=np.float32),  # Station 3[cite: 3]
-            np.array([90.0, 39.0], dtype=np.float32),   # Station 4[cite: 3]
-            np.array([42.0, 50.0], dtype=np.float32),   # Station 5[cite: 3]
-            np.array([96.0, 6.0], dtype=np.float32)     # Station 6[cite: 3]
+            np.array([135.0, 45.0], dtype=np.float32),  # Main Home Center Station
+            np.array([124.0, 83.0], dtype=np.float32),  # Station 1
+            np.array([182.0, 54.0], dtype=np.float32),  # Station 2
+            np.array([135.0, 18.0], dtype=np.float32),  # Station 3
+            np.array([90.0, 39.0], dtype=np.float32),   # Station 4
+            np.array([42.0, 50.0], dtype=np.float32),   # Station 5
+            np.array([96.0, 6.0], dtype=np.float32)     # Station 6
         ]
 
-        # Drone starts at the main home center station (index 0)[cite: 3]
+        # Drone starts at the main home center station (index 0)
         self.start_pos = self.stations[0]
 
-        # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid[cite: 1, 3]
+        # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid[cite: 1]
         print("Loading and scaling shapefile boundary...")
         boundary_file = "samo_tracts/samo_boundary.shp"
         park_boundary_gdf = gpd.read_file(boundary_file)
@@ -266,7 +301,7 @@ class AreaDiscoveryEnv(gym.Env):
         self.steps += 1
         self.trajectory.append(self.pos.copy())
 
-        # Automatically scale battery drain to use 100% capacity over the specified max steps[cite: 3]
+        # Automatically scale battery drain to use 100% capacity over the specified max steps
         self.battery -= (100.0 / self.max_steps)
 
         reward = 1.0
@@ -278,7 +313,7 @@ class AreaDiscoveryEnv(gym.Env):
             if not np.isnan(val):
                 current_temp = val
 
-        # Thermal reward shaping[cite: 3]
+        # Thermal reward shaping
         reward += (current_temp / 20.0)
 
         if not self.fire_scouted:
@@ -301,11 +336,11 @@ class AreaDiscoveryEnv(gym.Env):
             if min_dist_to_station <= 9.0:
                 closest_station_idx = np.argmin(distances)
                 if closest_station_idx == 0:
-                    reward += 150.0  # Home Station reward[cite: 3]
+                    reward += 150.0  # Home Station reward
                 else:
-                    reward += 250.0  # Station reward[cite: 3]
+                    reward += 250.0  # Station reward
             else:
-                reward -= 100.0  # Stranded penalty[cite: 3]
+                reward -= 100.0  # Stranded penalty
 
         return self._get_obs(), reward, terminated, truncated, {}
 
@@ -370,7 +405,7 @@ def select_action(state):
     else:
         return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
 
-def plot_trajectories(show_result=False):
+def plot_trajectories(filename=None):
     plt.figure(figsize=(10, 4.5))
     plt.clf()
 
@@ -421,7 +456,10 @@ def plot_trajectories(show_result=False):
     plt.legend(loc='upper right', fontsize=8)
     plt.grid(True, linestyle='--', alpha=0.3)
 
-    if is_ipython:
+    if filename:
+        plt.savefig(output_dir / filename, bbox_inches='tight')
+        plt.close()
+    elif is_ipython:
         display.clear_output(wait=True)
         display.display(plt.gcf())
 
@@ -489,17 +527,18 @@ for i_episode in range(num_episodes):
             episode_rewards.append(ep_reward)
 
             if (i_episode + 1) % 20 == 0:
-                plot_trajectories()
+                plot_trajectories(filename=f"trajectory_episode_{i_episode + 1}.png")
             break
 
 print('Training Complete')
-plot_trajectories(show_result=True)
+plot_trajectories(filename="final_trajectory.png")
 plt.ioff()
-plt.show()
 
-plt.figure(2)
+plt.figure(figsize=(10, 4.5))
 plt.plot(episode_rewards)
 plt.title(f'Reward over Time ({drone_spec["name"]})')
 plt.xlabel('Episode')
 plt.ylabel('Total Reward')
-plt.show()
+plt.grid(True, linestyle='--', alpha=0.3)
+plt.savefig(output_dir / "reward_over_time.png", bbox_inches='tight')
+plt.close()
