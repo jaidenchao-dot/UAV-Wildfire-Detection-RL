@@ -5,8 +5,21 @@ import argparse
 import os
 import shutil
 from pathlib import Path
+import sys
+import subprocess
 
-import gymnasium as gym
+try:
+    import gymnasium as gym
+except ImportError:
+    print("gymnasium is not installed. Installing now...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "gymnasium"])
+    # Try the import again after installation
+    try:
+        import gymnasium as gym
+        print("gymnasium installed successfully.")
+    except ImportError:
+        print("Failed to install gymnasium. Please install it manually.")
+        exit()
 from gymnasium import spaces
 import numpy as np
 import math
