@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""V2 UAV WILDFIRES - Multi-Drone Selection & Episode Config"""
+"""V2 UAV WILDFIRES - Multi-Drone Selection & Episode Config
+
+Training script. Saves the best Q-network weights (by rolling-average episode
+reward) plus the final weights to the weights folder, so they can be loaded by
+test_q_weights.py.
+
+The environment and network classes are importable without starting training:
+    from v2_uav_wildfires import AreaDiscoveryEnv, DQN, DRONE_SPECS
+"""
 
 import argparse
 import os
@@ -39,130 +47,17 @@ import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 import shapely.affinity
 
-# --- COMMAND-LINE ARGUMENT & OUTPUT FOLDER SETUP ---
-parser = argparse.ArgumentParser(description="UAV Wildfire Patrol Training Simulation")
-parser.add_argument("-o", "--output_folder", type=str, default = "photos", help="Local folder name to save output figures")
-parser.add_argument("-d", "--drone", type=str, choices=["Heavy Duty", "All-In-One", "Explorer"], default="All-In-One", help="Selected drone model")
-parser.add_argument("-e", "--episodes", type=int, default=300, help="Number of training episodes")
-args = parser.parse_args()
+# --- DRONE SPECS (shared with the test script) ---
+DRONE_SPECS = {
+    'Heavy Duty': {'name': 'Heavy Duty', 'max_steps': 30, 'discovery_radius': 10},
+    'All-In-One': {'name': 'All-In-One', 'max_steps': 50, 'discovery_radius': 5},
+    'Explorer': {'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2}
+}
 
-output_dir = Path(args.output_folder)
-if output_dir.exists():
-    # Clear existing files inside the folder
-    for item in output_dir.iterdir():
-        if item.is_file():
-            item.unlink()
-        elif item.is_dir():
-            shutil.rmtree(item)
-else:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-# --- CUSTOM GRAPHICAL CONFIGURATION SCREEN ---
-def select_drone_model():
-    plt.ioff()
-    fig, ax = plt.subplots(figsize=(9, 6.2))
-    plt.subplots_adjust(bottom=0.32)
-    ax.set_title("UAV Wildfire Patrol: Configuration Setup", fontsize=14, fontweight='bold', pad=15)
-    ax.axis('off')
-    
-    desc_text = (
-        "1. Select a drone model:\n"
-        "  • Heavy Duty (Max Steps: 30 | Radius: 10 units)\n"
-        "  • All-In-One (Max Steps: 50 | Radius: 5 units)\n"
-        "  • Explorer (Max Steps: 100 | Radius: 2 units)\n\n"
-        "2. Enter number of training episodes (300 to 6000):"
-    )
-    ax.text(0.05, 0.65, desc_text, fontsize=10.5, family='sans-serif', verticalalignment='center')
-    
-    selected_config = {}
-    
-    # Text box for episodes input
-    ax_box = plt.axes([0.28, 0.38, 0.44, 0.07])
-    text_box = TextBox(ax_box, 'Episodes: ', initial='300')
-    
-    # Buttons for drone selection
-    ax_btn1 = plt.axes([0.08, 0.12, 0.25, 0.1])
-    ax_btn2 = plt.axes([0.37, 0.12, 0.25, 0.1])
-    ax_btn3 = plt.axes([0.66, 0.12, 0.25, 0.1])
-    
-    btn1 = Button(ax_btn1, 'Heavy Duty', color='lightblue', hovercolor='skyblue')
-    btn2 = Button(ax_btn2, 'All-In-One', color='lightgreen', hovercolor='limegreen')
-    btn3 = Button(ax_btn3, 'Explorer', color='lightyellow', hovercolor='khaki')
-    
-    def get_episodes():
-        try:
-            val = int(text_box.text)
-            return max(300, min(6000, val))
-        except ValueError:
-            return 300
-            
-    def set_heavy(event):
-        selected_config.update({
-            'name': 'Heavy Duty', 
-            'max_steps': 30, 
-            'discovery_radius': 10,
-            'num_episodes': get_episodes()
-        })
-        plt.close(fig)
-        
-    def set_all(event):
-        selected_config.update({
-            'name': 'All-In-One', 
-            'max_steps': 50, 
-            'discovery_radius': 5,
-            'num_episodes': get_episodes()
-        })
-        plt.close(fig)
-        
-    def set_explorer(event):
-        selected_config.update({
-            'name': 'Explorer', 
-            'max_steps': 100, 
-            'discovery_radius': 2,
-            'num_episodes': get_episodes()
-        })
-        plt.close(fig)
-        
-    btn1.on_clicked(set_heavy)
-    btn2.on_clicked(set_all)
-    btn3.on_clicked(set_explorer)
-    
-    plt.savefig(output_dir / "config_setup.png", bbox_inches='tight')
-    # plt.show(block=True)
-    
-    if not selected_config:
-        selected_config.update({
-            'name': 'Explorer', 
-            'max_steps': 100, 
-            'discovery_radius': 2,
-            'num_episodes': 300
-        })
-        
-    print(f"Configuration Selected -> Drone: {selected_config['name']} | Max Steps: {selected_config['max_steps']} | Radius: {selected_config['discovery_radius']} | Episodes: {selected_config['num_episodes']}")
-    
-    plt.ion()
-    return selected_config
-
-
-# Launch configuration (via Streamlit command-line flags or fallback to interactive GUI)
-if args.drone and args.episodes:
-    specs = {
-        'Heavy Duty': {'name': 'Heavy Duty', 'max_steps': 30, 'discovery_radius': 10},
-        'All-In-One': {'name': 'All-In-One', 'max_steps': 50, 'discovery_radius': 5},
-        'Explorer': {'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2}
-    }
-    drone_spec = specs[args.drone]
-    drone_spec['num_episodes'] = max(300, min(6000, args.episodes))
-    print(f"Configuration Loaded -> Drone: {drone_spec['name']} | Max Steps: {drone_spec['max_steps']} | Radius: {drone_spec['discovery_radius']} | Episodes: {drone_spec['num_episodes']}")
-else:
-    drone_spec = select_drone_model()
-
-# set up matplotlib for training
-is_ipython = 'inline' in matplotlib.get_backend()
-if is_ipython:
-    from IPython import display
-
-plt.ion()
+# Rolling window (in episodes) used to decide which weights are "best".
+# A single episode's reward is very noisy (the 10000 fire bonus dominates), so
+# the best checkpoint is chosen by the average reward over this many episodes.
+BEST_WINDOW = 20
 
 # if GPU is to be used
 device = torch.device(
@@ -171,11 +66,84 @@ device = torch.device(
     "cpu"
 )
 
+
+def weights_filename(drone_name, kind="best"):
+    """e.g. best_q_weights_All-In-One.pt / final_q_weights_Heavy_Duty.pt"""
+    return f"{kind}_q_weights_{drone_name.replace(' ', '_')}.pt"
+
+
+# --- CUSTOM GRAPHICAL CONFIGURATION SCREEN ---
+def select_drone_model():
+    plt.ioff()
+    fig, ax = plt.subplots(figsize=(9, 6.2))
+    plt.subplots_adjust(bottom=0.32)
+    ax.set_title("UAV Wildfire Patrol: Configuration Setup", fontsize=14, fontweight='bold', pad=15)
+    ax.axis('off')
+
+    desc_text = (
+        "1. Select a drone model:\n"
+        "  • Heavy Duty (Max Steps: 30 | Radius: 10 units)\n"
+        "  • All-In-One (Max Steps: 50 | Radius: 5 units)\n"
+        "  • Explorer (Max Steps: 100 | Radius: 2 units)\n\n"
+        "2. Enter number of training episodes (300 to 6000):"
+    )
+    ax.text(0.05, 0.65, desc_text, fontsize=10.5, family='sans-serif', verticalalignment='center')
+
+    selected_config = {}
+
+    # Text box for episodes input
+    ax_box = plt.axes([0.28, 0.38, 0.44, 0.07])
+    text_box = TextBox(ax_box, 'Episodes: ', initial='300')
+
+    # Buttons for drone selection
+    ax_btn1 = plt.axes([0.08, 0.12, 0.25, 0.1])
+    ax_btn2 = plt.axes([0.37, 0.12, 0.25, 0.1])
+    ax_btn3 = plt.axes([0.66, 0.12, 0.25, 0.1])
+
+    btn1 = Button(ax_btn1, 'Heavy Duty', color='lightblue', hovercolor='skyblue')
+    btn2 = Button(ax_btn2, 'All-In-One', color='lightgreen', hovercolor='limegreen')
+    btn3 = Button(ax_btn3, 'Explorer', color='lightyellow', hovercolor='khaki')
+
+    def get_episodes():
+        try:
+            val = int(text_box.text)
+            return max(300, min(6000, val))
+        except ValueError:
+            return 300
+
+    def set_heavy(event):
+        selected_config.update(dict(DRONE_SPECS['Heavy Duty'], num_episodes=get_episodes()))
+        plt.close(fig)
+
+    def set_all(event):
+        selected_config.update(dict(DRONE_SPECS['All-In-One'], num_episodes=get_episodes()))
+        plt.close(fig)
+
+    def set_explorer(event):
+        selected_config.update(dict(DRONE_SPECS['Explorer'], num_episodes=get_episodes()))
+        plt.close(fig)
+
+    btn1.on_clicked(set_heavy)
+    btn2.on_clicked(set_all)
+    btn3.on_clicked(set_explorer)
+
+    plt.savefig(output_dir / "config_setup.png", bbox_inches='tight')
+    # plt.show(block=True)
+
+    if not selected_config:
+        selected_config.update(dict(DRONE_SPECS['Explorer'], num_episodes=300))
+
+    print(f"Configuration Selected -> Drone: {selected_config['name']} | Max Steps: {selected_config['max_steps']} | Radius: {selected_config['discovery_radius']} | Episodes: {selected_config['num_episodes']}")
+
+    plt.ion()
+    return selected_config
+
+
 class AreaDiscoveryEnv(gym.Env):
     def __init__(self, config):
         super().__init__()
         self.action_space = spaces.Discrete(9)
-        
+
         self.drone_name = config['name']
         self.max_steps = config['max_steps']
         self.discovery_radius = config['discovery_radius']
@@ -204,16 +172,16 @@ class AreaDiscoveryEnv(gym.Env):
         # Drone starts at the main home center station (index 0)
         self.start_pos = self.stations[0]
 
-        # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid[cite: 1]
+        # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid
         print("Loading and scaling shapefile boundary...")
         boundary_file = "samo_tracts/samo_boundary.shp"
         park_boundary_gdf = gpd.read_file(boundary_file)
         raw_polygon = park_boundary_gdf.geometry.unary_union
-        
+
         minx, miny, maxx, maxy = raw_polygon.bounds
         scale_x = self.grid_x / (maxx - minx)
         scale_y = self.grid_y / (maxy - miny)
-        
+
         translated_poly = shapely.affinity.translate(raw_polygon, xoff=-minx, yoff=-miny)
         self.boundary_polygon = shapely.affinity.scale(translated_poly, xfact=scale_x, yfact=scale_y, origin=(0, 0))
 
@@ -357,7 +325,9 @@ class AreaDiscoveryEnv(gym.Env):
 
         return self._get_obs(), reward, terminated, truncated, {}
 
+
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
 
 class ReplayMemory(object):
     def __init__(self, capacity):
@@ -372,6 +342,7 @@ class ReplayMemory(object):
     def __len__(self):
         return len(self.memory)
 
+
 class DQN(nn.Module):
     def __init__(self, n_observations, n_actions):
         super(DQN, self).__init__()
@@ -384,6 +355,7 @@ class DQN(nn.Module):
         x = F.relu(self.layer2(x))
         return self.layer3(x)
 
+
 BATCH_SIZE = 128
 GAMMA = 0.99
 EPS_START = 0.9
@@ -392,20 +364,19 @@ EPS_DECAY = 10000
 TAU = 0.005
 LR = 1e-3
 
-env = AreaDiscoveryEnv(drone_spec)
-n_actions = env.action_space.n
-state, info = env.reset()
-n_observations = len(state)
 
-policy_net = DQN(n_observations, n_actions).to(device)
-target_net = DQN(n_observations, n_actions).to(device)
-target_net.load_state_dict(policy_net.state_dict())
+def save_checkpoint(path, net, episode, avg_reward):
+    """Save Q-network weights plus the metadata needed to rebuild env + net."""
+    torch.save({
+        'model_state_dict': net.state_dict(),
+        'drone_spec': {k: drone_spec[k] for k in ('name', 'max_steps', 'discovery_radius')},
+        'n_observations': int(n_observations),
+        'n_actions': int(n_actions),
+        'episode': int(episode),
+        'avg_reward': float(avg_reward),
+        'window': BEST_WINDOW,
+    }, path)
 
-optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
-memory = ReplayMemory(10000)
-steps_done = 0
-all_trajectories = [] 
-episode_rewards = []
 
 def select_action(state):
     global steps_done
@@ -417,6 +388,7 @@ def select_action(state):
             return policy_net(state).max(1).indices.view(1, 1)
     else:
         return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
+
 
 def plot_trajectories(filename=None):
     plt.figure(figsize=(10, 4.5))
@@ -476,6 +448,7 @@ def plot_trajectories(filename=None):
         display.clear_output(wait=True)
         display.display(plt.gcf())
 
+
 def optimize_model():
     if len(memory) < BATCH_SIZE:
         return
@@ -504,54 +477,138 @@ def optimize_model():
     torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
     optimizer.step()
 
-# Use the number of episodes specified by the user in the configuration window
-num_episodes = drone_spec['num_episodes']
 
-for i_episode in range(num_episodes):
+if __name__ == "__main__":
+    # --- COMMAND-LINE ARGUMENT & OUTPUT FOLDER SETUP ---
+    parser = argparse.ArgumentParser(description="UAV Wildfire Patrol Training Simulation")
+    parser.add_argument("-o", "--output_folder", type=str, default="photos", help="Local folder name to save output figures")
+    parser.add_argument("-d", "--drone", type=str, choices=["Heavy Duty", "All-In-One", "Explorer"], default="All-In-One", help="Selected drone model")
+    parser.add_argument("-e", "--episodes", type=int, default=300, help="Number of training episodes")
+    parser.add_argument("-w", "--weights_folder", type=str, default="weights",
+                        help="Folder to save Q-weights (kept separate from the output folder, which is cleared on every run)")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_folder)
+    if output_dir.exists():
+        # Clear existing files inside the folder
+        for item in output_dir.iterdir():
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                shutil.rmtree(item)
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    weights_dir = Path(args.weights_folder)
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    # Launch configuration (via Streamlit command-line flags or fallback to interactive GUI)
+    if args.drone and args.episodes:
+        drone_spec = dict(DRONE_SPECS[args.drone])
+        drone_spec['num_episodes'] = max(100, min(6000, args.episodes))
+        print(f"Configuration Loaded -> Drone: {drone_spec['name']} | Max Steps: {drone_spec['max_steps']} | Radius: {drone_spec['discovery_radius']} | Episodes: {drone_spec['num_episodes']}")
+    else:
+        drone_spec = select_drone_model()
+
+    # set up matplotlib for training
+    is_ipython = 'inline' in matplotlib.get_backend()
+    if is_ipython:
+        from IPython import display
+
+    plt.ion()
+
+    env = AreaDiscoveryEnv(drone_spec)
+    n_actions = env.action_space.n
     state, info = env.reset()
-    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+    n_observations = len(state)
 
-    ep_reward = 0
-    for t in count():
-        action = select_action(state)
-        observation, reward, terminated, truncated, _ = env.step(action.item())
-        ep_reward += reward
-        reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
-        done = terminated or truncated
+    policy_net = DQN(n_observations, n_actions).to(device)
+    target_net = DQN(n_observations, n_actions).to(device)
+    target_net.load_state_dict(policy_net.state_dict())
 
-        if terminated:
-            next_state = None
-        else:
-            next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+    optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
+    memory = ReplayMemory(10000)
+    steps_done = 0
+    all_trajectories = []
+    episode_rewards = []
 
-        memory.push(state, action, next_state, reward_tensor)
-        state = next_state
+    best_path = weights_dir / weights_filename(drone_spec['name'], "best")
+    final_path = weights_dir / weights_filename(drone_spec['name'], "final")
+    best_avg_reward = -float('inf')
+    best_episode = None
 
-        optimize_model()
+    # Use the number of episodes specified by the user in the configuration window
+    num_episodes = drone_spec['num_episodes']
 
-        target_net_state_dict = target_net.state_dict()
-        policy_net_state_dict = policy_net.state_dict()
-        for key in policy_net_state_dict:
-            target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
-        target_net.load_state_dict(target_net_state_dict)
+    for i_episode in range(num_episodes):
+        state, info = env.reset()
+        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
 
-        if done:
-            all_trajectories.append(env.trajectory)
-            episode_rewards.append(ep_reward)
+        ep_reward = 0
+        for t in count():
+            action = select_action(state)
+            observation, reward, terminated, truncated, _ = env.step(action.item())
+            ep_reward += reward
+            reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
+            done = terminated or truncated
 
-            if (i_episode + 1) % 20 == 0:
-                plot_trajectories(filename=f"trajectory_episode_{i_episode + 1}.png")
-            break
+            if terminated:
+                next_state = None
+            else:
+                next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
 
-print('Training Complete')
-plot_trajectories(filename="final_trajectory.png")
-plt.ioff()
+            memory.push(state, action, next_state, reward_tensor)
+            state = next_state
 
-plt.figure(figsize=(10, 4.5))
-plt.plot(episode_rewards)
-plt.title(f'Reward over Time ({drone_spec["name"]})')
-plt.xlabel('Episode')
-plt.ylabel('Total Reward')
-plt.grid(True, linestyle='--', alpha=0.3)
-plt.savefig(output_dir / "reward_over_time.png", bbox_inches='tight')
-plt.close()
+            optimize_model()
+
+            target_net_state_dict = target_net.state_dict()
+            policy_net_state_dict = policy_net.state_dict()
+            for key in policy_net_state_dict:
+                target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
+            target_net.load_state_dict(target_net_state_dict)
+
+            if done:
+                all_trajectories.append(env.trajectory)
+                episode_rewards.append(ep_reward)
+
+                # --- Best-weights checkpointing (rolling average) ---
+                if len(episode_rewards) >= BEST_WINDOW:
+                    rolling_avg = float(np.mean(episode_rewards[-BEST_WINDOW:]))
+                    if rolling_avg > best_avg_reward:
+                        best_avg_reward = rolling_avg
+                        best_episode = i_episode + 1
+                        save_checkpoint(best_path, policy_net, best_episode, best_avg_reward)
+
+                if (i_episode + 1) % 20 == 0:
+                    plot_trajectories(filename=f"trajectory_episode_{i_episode + 1}.png")
+                break
+
+    print('Training Complete')
+
+    # Always save the final weights too, for comparison with the best checkpoint
+    final_avg = float(np.mean(episode_rewards[-BEST_WINDOW:])) if episode_rewards else 0.0
+    save_checkpoint(final_path, policy_net, num_episodes, final_avg)
+    if best_episode is not None:
+        print(f"Best Q-weights saved -> {best_path} (episode {best_episode}, "
+              f"{BEST_WINDOW}-episode avg reward {best_avg_reward:.1f})")
+    print(f"Final Q-weights saved -> {final_path}")
+
+    plot_trajectories(filename="final_trajectory.png")
+    plt.ioff()
+
+    plt.figure(figsize=(10, 4.5))
+    plt.plot(episode_rewards, alpha=0.5, label='Episode reward')
+    if len(episode_rewards) >= BEST_WINDOW:
+        rolling = np.convolve(episode_rewards, np.ones(BEST_WINDOW) / BEST_WINDOW, mode='valid')
+        plt.plot(range(BEST_WINDOW - 1, len(episode_rewards)), rolling, color='black',
+                 linewidth=2, label=f'{BEST_WINDOW}-episode average')
+    if best_episode is not None:
+        plt.axvline(best_episode - 1, color='green', linestyle='--', label=f'Best weights (ep {best_episode})')
+    plt.title(f'Reward over Time ({drone_spec["name"]})')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.legend(fontsize=8)
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.savefig(output_dir / "reward_over_time.png", bbox_inches='tight')
+    plt.close()
