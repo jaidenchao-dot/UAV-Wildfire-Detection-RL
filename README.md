@@ -76,7 +76,8 @@ The model was trained in a simulated environment representing the Santa Monica M
 
 To convert the geographic boundaries into a usable environment for the algorithm, the GeoPandas library was used and scaled into a 250 x 100 simulation grid. The code creates a mask to distinguish valid locations within the geographic boundary from invalid locations outside it. This allows the simulation to restrict the UAV’s movement to locations within the wanted region. Seven ranger station locations were synthetically generated, a center one being the main starting station, and six additional ones. This is because verified station location data was unavailable or unsuitable for this project's intentions.
 
-![][image1]
+<img width="631" height="252" alt="image" src="https://github.com/user-attachments/assets/863fd769-7faa-4b31-add6-0858f4a9dd45" />
+
 
 It was decided to generate randomized wildfire scenarios rather than using a fixed set of historical wildfire locations in order to make the model suitable for any scenario. This means that the randomization exposes the model to different simulated conditions instead of the same location over and over again. Each simulation generates 5 to 9 random thermal hotspots within the geographic boundary and a continuous thermal intensity distribution around these hotspots using Gaussian functions. Thermal intensity values range from 0 to 100 and they are simulated values, not real temperatures measured in degrees Celsius. The program randomly generates a simulated wildfire location on grid cells with thermal intensity values of at least 75\. At the beginning of each episode, a new thermal distribution and wildfire location is generated which creates variation in the training scenarios and allows the model to be flexible.
 
