@@ -1,5 +1,23 @@
 # -*- coding: utf-8 -*-
-"""V2 UAV WILDFIRES - Multi-Drone Selection & Episode Config with Elevation"""
+"""V2 UAV WILDFIRES - Multi-Drone Selection & Episode Config
+
+Training script. Saves the best Q-network weights (by rolling-average episode
+reward) plus the final weights to the weights folder, so they can be loaded by
+test_q_weights.py.
+
+Reward / recharge rules:
+  * Heat reward is 40x the old rate (2 x temperature per step), paid only for
+    ground the drone has not searched yet (0 when hovering or re-flying a path).
+  * The drone has an 8-direction thermal sensor so it can tell which way is hotter.
+  * Landing at any station pays 100. A landing counts when the drone has left the
+    station area since its last charge and its battery is at or below 30%, or
+    when its battery runs out inside a station area.
+  * The first 3 landings recharge the drone (battery and step count reset) and
+    the flight continues. The 4th landing ends the flight.
+
+The environment and network classes are importable without starting training:
+    from v2_uav_wildfires import AreaDiscoveryEnv, DQN, DRONE_SPECS
+"""
 
 import argparse
 import os
@@ -7,20 +25,19 @@ import shutil
 from pathlib import Path
 import sys
 import subprocess
-import glob
 
 try:
     import gymnasium as gym
 except ImportError:
     print("gymnasium is not installed. Installing now...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "gymnasium"])
+    # Try the import again after installation
     try:
         import gymnasium as gym
         print("gymnasium installed successfully.")
     except ImportError:
         print("Failed to install gymnasium. Please install it manually.")
         exit()
-
 from gymnasium import spaces
 import numpy as np
 import math
@@ -40,33 +57,42 @@ import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
 import shapely.affinity
 
-# Rasterio imports with detailed error tracking
-RASTERIO_AVAILABLE = True
-try:
-    import rasterio
-    from rasterio.merge import merge
-    from rasterio.warp import reproject, Resampling
-    from rasterio.transform import from_bounds
-except Exception as e:
-    RASTERIO_AVAILABLE = False
-    print(f"\n>>> RASTERIO IMPORT FAILED DUE TO: {e}\n")
+# --- DRONE SPECS (shared with the test script) ---
+DRONE_SPECS = {
+    'Heavy Duty': {'name': 'Heavy Duty', 'max_steps': 30, 'discovery_radius': 10},
+    'All-In-One': {'name': 'All-In-One', 'max_steps': 50, 'discovery_radius': 5},
+    'Explorer': {'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2}
+}
 
-# --- COMMAND-LINE ARGUMENT & OUTPUT FOLDER SETUP ---
-parser = argparse.ArgumentParser(description="UAV Wildfire Patrol Training Simulation")
-parser.add_argument("-o", "--output_folder", type=str, default="photos", help="Local folder name to save output figures")
-parser.add_argument("-d", "--drone", type=str, choices=["Heavy Duty", "All-In-One", "Explorer"], default="All-In-One", help="Selected drone model")
-parser.add_argument("-e", "--episodes", type=int, default=300, help="Number of training episodes")
-args = parser.parse_args()
+# --- REWARD / RECHARGE SETTINGS ---
+HEAT_REWARD_SCALE = 2.0            # 40x the old (current_temp / 20); paid only on fresh ground
+FIRE_REWARD = 10000.0
+LANDING_REWARD = 100.0             # every station, every landing
+LOW_BATTERY_PENALTY = -5.0         # per step at <= 20% battery away from a station
+STRANDED_PENALTY = -100.0          # battery runs out away from a station
+STATION_RADIUS = 9.0
+MAX_RECHARGES = 3                  # landing #4 ends the flight
+LANDING_BATTERY_THRESHOLD = 30.0   # a landing counts only at or below this battery %
+N_SENSOR_DIRECTIONS = 8
+OBS_VERSION = 3                    # bump whenever the observation layout changes
 
-output_dir = Path(args.output_folder)
-if output_dir.exists():
-    for item in output_dir.iterdir():
-        if item.is_file():
-            item.unlink()
-        elif item.is_dir():
-            shutil.rmtree(item)
-else:
-    output_dir.mkdir(parents=True, exist_ok=True)
+# Rolling window (in episodes) used to decide which weights are "best".
+# A single episode's reward is very noisy (the 10000 fire bonus dominates), so
+# the best checkpoint is chosen by the average reward over this many episodes.
+BEST_WINDOW = 20
+
+# if GPU is to be used
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else
+    "mps" if torch.backends.mps.is_available() else
+    "cpu"
+)
+
+
+def weights_filename(drone_name, kind="best"):
+    """e.g. best_q_weights_All-In-One.pt / final_q_weights_Heavy_Duty.pt"""
+    return f"{kind}_q_weights_{drone_name.replace(' ', '_')}.pt"
+
 
 # --- CUSTOM GRAPHICAL CONFIGURATION SCREEN ---
 def select_drone_model():
@@ -75,7 +101,7 @@ def select_drone_model():
     plt.subplots_adjust(bottom=0.32)
     ax.set_title("UAV Wildfire Patrol: Configuration Setup", fontsize=14, fontweight='bold', pad=15)
     ax.axis('off')
-    
+
     desc_text = (
         "1. Select a drone model:\n"
         "  • Heavy Duty (Max Steps: 30 | Radius: 10 units)\n"
@@ -84,115 +110,87 @@ def select_drone_model():
         "2. Enter number of training episodes (300 to 6000):"
     )
     ax.text(0.05, 0.65, desc_text, fontsize=10.5, family='sans-serif', verticalalignment='center')
-    
+
     selected_config = {}
-    
+
+    # Text box for episodes input
     ax_box = plt.axes([0.28, 0.38, 0.44, 0.07])
     text_box = TextBox(ax_box, 'Episodes: ', initial='300')
-    
+
+    # Buttons for drone selection
     ax_btn1 = plt.axes([0.08, 0.12, 0.25, 0.1])
     ax_btn2 = plt.axes([0.37, 0.12, 0.25, 0.1])
     ax_btn3 = plt.axes([0.66, 0.12, 0.25, 0.1])
-    
+
     btn1 = Button(ax_btn1, 'Heavy Duty', color='lightblue', hovercolor='skyblue')
     btn2 = Button(ax_btn2, 'All-In-One', color='lightgreen', hovercolor='limegreen')
     btn3 = Button(ax_btn3, 'Explorer', color='lightyellow', hovercolor='khaki')
-    
+
     def get_episodes():
         try:
             val = int(text_box.text)
             return max(300, min(6000, val))
         except ValueError:
             return 300
-            
+
     def set_heavy(event):
-        selected_config.update({
-            'name': 'Heavy Duty', 
-            'max_steps': 30, 
-            'discovery_radius': 10,
-            'num_episodes': get_episodes()
-        })
+        selected_config.update(dict(DRONE_SPECS['Heavy Duty'], num_episodes=get_episodes()))
         plt.close(fig)
-        
+
     def set_all(event):
-        selected_config.update({
-            'name': 'All-In-One', 
-            'max_steps': 50, 
-            'discovery_radius': 5,
-            'num_episodes': get_episodes()
-        })
+        selected_config.update(dict(DRONE_SPECS['All-In-One'], num_episodes=get_episodes()))
         plt.close(fig)
-        
+
     def set_explorer(event):
-        selected_config.update({
-            'name': 'Explorer', 
-            'max_steps': 100, 
-            'discovery_radius': 2,
-            'num_episodes': get_episodes()
-        })
+        selected_config.update(dict(DRONE_SPECS['Explorer'], num_episodes=get_episodes()))
         plt.close(fig)
-        
+
     btn1.on_clicked(set_heavy)
     btn2.on_clicked(set_all)
     btn3.on_clicked(set_explorer)
-    
+
     plt.savefig(output_dir / "config_setup.png", bbox_inches='tight')
-    
+    # plt.show(block=True)
+
     if not selected_config:
-        selected_config.update({
-            'name': 'Explorer', 
-            'max_steps': 100, 
-            'discovery_radius': 2,
-            'num_episodes': 300
-        })
-        
+        selected_config.update(dict(DRONE_SPECS['Explorer'], num_episodes=300))
+
     print(f"Configuration Selected -> Drone: {selected_config['name']} | Max Steps: {selected_config['max_steps']} | Radius: {selected_config['discovery_radius']} | Episodes: {selected_config['num_episodes']}")
-    
+
     plt.ion()
     return selected_config
 
-if args.drone and args.episodes:
-    specs = {
-        'Heavy Duty': {'name': 'Heavy Duty', 'max_steps': 30, 'discovery_radius': 10},
-        'All-In-One': {'name': 'All-In-One', 'max_steps': 50, 'discovery_radius': 5},
-        'Explorer': {'name': 'Explorer', 'max_steps': 100, 'discovery_radius': 2}
-    }
-    drone_spec = specs[args.drone]
-    drone_spec['num_episodes'] = max(300, min(6000, args.episodes))
-    print(f"Configuration Loaded -> Drone: {drone_spec['name']} | Max Steps: {drone_spec['max_steps']} | Radius: {drone_spec['discovery_radius']} | Episodes: {drone_spec['num_episodes']}")
-else:
-    drone_spec = select_drone_model()
-
-is_ipython = 'inline' in matplotlib.get_backend()
-if is_ipython:
-    from IPython import display
-
-plt.ion()
-
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else
-    "mps" if torch.backends.mps.is_available() else
-    "cpu"
-)
 
 class AreaDiscoveryEnv(gym.Env):
     def __init__(self, config):
         super().__init__()
         self.action_space = spaces.Discrete(9)
-        
+
         self.drone_name = config['name']
         self.max_steps = config['max_steps']
         self.discovery_radius = config['discovery_radius']
 
+        # Thermal sensor ring: temperature in 8 directions at a look-ahead distance
+        self.sensor_range = max(8.0, 2.0 * self.discovery_radius)
+        angles = 2 * np.pi * np.arange(N_SENSOR_DIRECTIONS) / N_SENSOR_DIRECTIONS
+        self.sensor_offsets = np.stack([np.cos(angles), np.sin(angles)], axis=1) * self.sensor_range
+
+        # About how many new tiles one straight step reveals (used to scale the heat reward)
+        self.tiles_per_step = (2 * self.discovery_radius + 1) * 2.1
+
+        # Observation: [dist_x, dist_y, steps_left, battery, current_temp, 8 sensor temps, recharges_left]
+        low = [-250.0, -100.0, 0.0, 0.0, 0.0] + [0.0] * N_SENSOR_DIRECTIONS + [0.0]
+        high = [250.0, 100.0, float(self.max_steps), 100.0, 100.0] + [100.0] * N_SENSOR_DIRECTIONS + [float(MAX_RECHARGES)]
         self.observation_space = spaces.Box(
-            low=np.array([-250.0, -100.0, 0, 0.0, 0.0, 0.0]),
-            high=np.array([250.0, 100.0, float(self.max_steps), 100.0, 100.0, 10000.0]),
+            low=np.array(low, dtype=np.float32),
+            high=np.array(high, dtype=np.float32),
             dtype=np.float32
         )
 
         self.grid_x = 250
         self.grid_y = 100
 
+        # Ranger Stations: Main station at index 0, followed by the 6 custom stations
         self.stations = [
             np.array([135.0, 45.0], dtype=np.float32),  # Main Home Center Station
             np.array([124.0, 83.0], dtype=np.float32),  # Station 1
@@ -203,17 +201,19 @@ class AreaDiscoveryEnv(gym.Env):
             np.array([96.0, 6.0], dtype=np.float32)     # Station 6
         ]
 
+        # Drone starts at the main home center station (index 0)
         self.start_pos = self.stations[0]
 
+        # Load the shapefile and dynamically scale it to fit the 250x100 RL environment grid
         print("Loading and scaling shapefile boundary...")
         boundary_file = "samo_tracts/samo_boundary.shp"
         park_boundary_gdf = gpd.read_file(boundary_file)
-        raw_polygon = park_boundary_gdf.geometry.union_all()
-        
+        raw_polygon = park_boundary_gdf.geometry.unary_union
+
         minx, miny, maxx, maxy = raw_polygon.bounds
         scale_x = self.grid_x / (maxx - minx)
         scale_y = self.grid_y / (maxy - miny)
-        
+
         translated_poly = shapely.affinity.translate(raw_polygon, xoff=-minx, yoff=-miny)
         self.boundary_polygon = shapely.affinity.scale(translated_poly, xfact=scale_x, yfact=scale_y, origin=(0, 0))
 
@@ -222,53 +222,6 @@ class AreaDiscoveryEnv(gym.Env):
             for j in range(self.grid_y):
                 if self.boundary_polygon.contains(Point(i, j)):
                     self.valid_mask[i, j] = True
-
-        print("Loading and merging elevation GeoTIFF tiles...")
-        self.elevation_grid = np.zeros((self.grid_x, self.grid_y), dtype=np.float32)
-        
-        elevation_paths = []
-        for ext in ['*.tif', '*.TIF', '*.tiff', '*.TIFF']:
-            elevation_paths.extend(glob.glob(f"samo_tracts/elevation/{ext}"))
-
-        if elevation_paths and RASTERIO_AVAILABLE:
-            try:
-                print(f"Found {len(elevation_paths)} elevation tile(s). Mosaicking...")
-                src_files = [rasterio.open(fp) for fp in elevation_paths]
-                mosaic, out_trans = merge(src_files)
-                out_meta = src_files[0].meta.copy()
-                shp_crs = park_boundary_gdf.crs
-                
-                for src in src_files:
-                    src.close()
-
-                destination_array = np.zeros((1, self.grid_y, self.grid_x), dtype=np.float32)
-                destination_transform = from_bounds(minx, miny, maxx, maxy, self.grid_x, self.grid_y)
-
-                with rasterio.io.MemoryFile() as memfile:
-                    out_meta.update({
-                        "height": mosaic.shape[1],
-                        "width": mosaic.shape[2],
-                        "transform": out_trans
-                    })
-                    with memfile.open(**out_meta) as dataset:
-                        dataset.write(mosaic)
-                        reproject(
-                            source=rasterio.band(dataset, 1),
-                            destination=destination_array[0],
-                            src_transform=dataset.transform,
-                            src_crs=dataset.crs,
-                            dst_transform=destination_transform,
-                            dst_crs=shp_crs,
-                            resampling=Resampling.bilinear
-                        )
-                self.elevation_grid = destination_array[0].T
-                print("Elevation tiles successfully merged and aligned to environment grid!")
-            except Exception as e:
-                print(f"Error processing elevation tiles: {e}")
-        else:
-            print(f"Rasterio available: {RASTERIO_AVAILABLE}. Number of paths found: {len(elevation_paths)}")
-
-        self.elevation_grid[~self.valid_mask] = 0.0
 
         self.temperature_grid = np.zeros((self.grid_x, self.grid_y), dtype=np.float32)
         self.fire_pos = np.array([0.0, 0.0], dtype=np.float32)
@@ -308,16 +261,29 @@ class AreaDiscoveryEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.pos = self.start_pos.copy()
-        self.steps = 0
+        self.steps = 0              # steps on the current battery charge (resets on recharge)
+        self.total_steps = 0        # steps across the whole flight
         self.battery = 100.0
+        self.recharges_used = 0
+        self.left_station = False   # starts parked at home
+        self.landed = False         # True if the flight ended with a landing
+        self.recharge_points = []
 
         self._generate_scenario()
 
         self.visited = ~self.valid_mask.copy()
         self.trajectory = [self.pos.copy()]
-        self._mark_visited()
+        self._mark_visited()  # ground under the start station is already seen (not rewarded)
 
         return self._get_obs(), {}
+
+    def _temp_at(self, px, py, default):
+        x, y = int(np.floor(px)), int(np.floor(py))
+        if 0 <= x < self.grid_x and 0 <= y < self.grid_y and self.valid_mask[x, y]:
+            val = self.temperature_grid[x, y]
+            if not np.isnan(val):
+                return float(val)
+        return default
 
     def _get_obs(self):
         closest_station = min(self.stations, key=lambda s: np.linalg.norm(self.pos - s))
@@ -325,17 +291,13 @@ class AreaDiscoveryEnv(gym.Env):
         dist_y = closest_station[1] - self.pos[1]
         steps_left = self.max_steps - self.steps
 
-        x, y = int(self.pos[0]), int(self.pos[1])
-        if 0 <= x < self.grid_x and 0 <= y < self.grid_y and self.valid_mask[x, y]:
-            current_temp = self.temperature_grid[x, y]
-            if np.isnan(current_temp):
-                current_temp = 50.0
-            current_elev = self.elevation_grid[x, y]
-        else:
-            current_temp = 50.0
-            current_elev = 0.0
+        current_temp = self._temp_at(self.pos[0], self.pos[1], default=50.0)
+        # Sensor readings outside the park read 0 (nowhere to fly there)
+        ring = [self._temp_at(self.pos[0] + ox, self.pos[1] + oy, default=0.0) for ox, oy in self.sensor_offsets]
+        recharges_left = MAX_RECHARGES - self.recharges_used
 
-        return np.array([dist_x, dist_y, steps_left, self.battery, current_temp, current_elev], dtype=np.float32)
+        return np.array([dist_x, dist_y, steps_left, self.battery, current_temp] + ring + [recharges_left],
+                        dtype=np.float32)
 
     def _mark_visited(self):
         x, y = int(self.pos[0]), int(self.pos[1])
@@ -350,9 +312,6 @@ class AreaDiscoveryEnv(gym.Env):
         return new_tiles
 
     def step(self, action):
-        old_x, old_y = int(self.pos[0]), int(self.pos[1])
-        old_elev = self.elevation_grid[old_x, old_y] if (0 <= old_x < self.grid_x and 0 <= old_y < self.grid_y) else 0.0
-
         dx = (action % 3 - 1) * 2.1
         dy = (action // 3 - 1) * 2.1
 
@@ -364,54 +323,68 @@ class AreaDiscoveryEnv(gym.Env):
             self.pos[1] = proposed_y
 
         self.steps += 1
+        self.total_steps += 1
         self.trajectory.append(self.pos.copy())
 
-        new_x, new_y = int(self.pos[0]), int(self.pos[1])
-        new_elev = self.elevation_grid[new_x, new_y] if (0 <= new_x < self.grid_x and 0 <= new_y < self.grid_y) else 0.0
-
-        elev_diff = max(0.0, new_elev - old_elev)
-        climb_penalty = (elev_diff / 100.0) * (50.0 / self.max_steps)
-        self.battery -= ((100.0 / self.max_steps) + climb_penalty)
+        # Automatically scale battery drain to use 100% capacity over the specified max steps
+        self.battery -= (100.0 / self.max_steps)
 
         reward = 1.0
 
-        current_temp = 50.0
-        if 0 <= new_x < self.grid_x and 0 <= new_y < self.grid_y and self.valid_mask[new_x, new_y]:
-            val = self.temperature_grid[new_x, new_y]
-            if not np.isnan(val):
-                current_temp = val
-
-        reward += (current_temp / 20.0)
+        # Heat reward: 40x the old rate, paid only for ground not searched yet
+        # (full rate on fresh ground, less when overlapping, 0 when hovering)
+        current_temp = self._temp_at(self.pos[0], self.pos[1], default=50.0)
+        new_tiles = self._mark_visited()
+        fresh_fraction = min(1.0, new_tiles / self.tiles_per_step)
+        reward += HEAT_REWARD_SCALE * current_temp * fresh_fraction
 
         if not self.fire_scouted:
             dist_to_fire = np.linalg.norm(self.pos - self.fire_pos)
             if dist_to_fire <= self.discovery_radius:
-                reward += 10000.0
+                reward += FIRE_REWARD
                 self.fire_scouted = True
 
         distances = [np.linalg.norm(self.pos - station) for station in self.stations]
         min_dist_to_station = min(distances)
+        at_station = min_dist_to_station <= STATION_RADIUS
 
-        if self.battery <= 20.0 and min_dist_to_station > 9.0:
-            reward -= 5.0
+        if not at_station:
+            self.left_station = True
+
+        if self.battery <= 20.0 and not at_station:
+            reward += LOW_BATTERY_PENALTY
 
         terminated = False
         truncated = False
 
-        if self.steps >= self.max_steps or self.battery <= 0:
-            terminated = True
-            if min_dist_to_station <= 9.0:
-                closest_station_idx = np.argmin(distances)
-                if closest_station_idx == 0:
-                    reward += 150.0
-                else:
-                    reward += 250.0
+        battery_empty = self.steps >= self.max_steps or self.battery <= 0
+
+        # A landing counts if the drone left the station area since its last charge and
+        # its battery is at or below the threshold, or if the battery runs out at a station
+        landing = at_station and (battery_empty or
+                                  (self.left_station and self.battery <= LANDING_BATTERY_THRESHOLD))
+
+        if landing:
+            reward += LANDING_REWARD
+            if self.recharges_used < MAX_RECHARGES:
+                # Recharge: battery and step count reset, flight continues
+                self.recharges_used += 1
+                self.battery = 100.0
+                self.steps = 0
+                self.left_station = False
+                self.recharge_points.append(self.pos.copy())
             else:
-                reward -= 100.0
+                terminated = True  # no recharges left: this landing ends the flight
+                self.landed = True
+        elif battery_empty:
+            terminated = True
+            reward += STRANDED_PENALTY
 
         return self._get_obs(), reward, terminated, truncated, {}
 
+
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
 
 class ReplayMemory(object):
     def __init__(self, capacity):
@@ -426,6 +399,7 @@ class ReplayMemory(object):
     def __len__(self):
         return len(self.memory)
 
+
 class DQN(nn.Module):
     def __init__(self, n_observations, n_actions):
         super(DQN, self).__init__()
@@ -438,6 +412,7 @@ class DQN(nn.Module):
         x = F.relu(self.layer2(x))
         return self.layer3(x)
 
+
 BATCH_SIZE = 128
 GAMMA = 0.99
 EPS_START = 0.9
@@ -446,20 +421,21 @@ EPS_DECAY = 10000
 TAU = 0.005
 LR = 1e-3
 
-env = AreaDiscoveryEnv(drone_spec)
-n_actions = env.action_space.n
-state, info = env.reset()
-n_observations = len(state)
 
-policy_net = DQN(n_observations, n_actions).to(device)
-target_net = DQN(n_observations, n_actions).to(device)
-target_net.load_state_dict(policy_net.state_dict())
+def save_checkpoint(path, net, episode, avg_reward):
+    """Save Q-network weights plus the metadata needed to rebuild env + net."""
+    torch.save({
+        'model_state_dict': net.state_dict(),
+        'drone_spec': {k: drone_spec[k] for k in ('name', 'max_steps', 'discovery_radius')},
+        'n_observations': int(n_observations),
+        'n_actions': int(n_actions),
+        'obs_version': OBS_VERSION,
+        'max_recharges': MAX_RECHARGES,
+        'episode': int(episode),
+        'avg_reward': float(avg_reward),
+        'window': BEST_WINDOW,
+    }, path)
 
-optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
-memory = ReplayMemory(10000)
-steps_done = 0
-all_trajectories = [] 
-episode_rewards = []
 
 def select_action(state):
     global steps_done
@@ -471,6 +447,7 @@ def select_action(state):
             return policy_net(state).max(1).indices.view(1, 1)
     else:
         return torch.tensor([[env.action_space.sample()]], device=device, dtype=torch.long)
+
 
 def plot_trajectories(filename=None):
     plt.figure(figsize=(10, 4.5))
@@ -516,6 +493,11 @@ def plot_trajectories(filename=None):
         latest_traj = np.array(all_trajectories[-1])
         plt.plot(latest_traj[:, 0], latest_traj[:, 1], color='blue', linewidth=2, label="Latest Flight Path", zorder=4)
 
+    # Where the latest flight recharged
+    if env.recharge_points:
+        rp = np.array(env.recharge_points)
+        plt.scatter(rp[:, 0], rp[:, 1], color='limegreen', edgecolors='black', marker='P', s=120, zorder=7, label="Recharge")
+
     plt.xlabel("East-West Distance Units (~0.16 miles / unit)", fontsize=10)
     plt.ylabel("North-South Distance Units (~0.16 miles / unit)", fontsize=10)
     plt.title(f'Santa Monica Mountains Patrol ({drone_spec["name"]} - Radius: {drone_spec["discovery_radius"]})', fontsize=12)
@@ -529,6 +511,7 @@ def plot_trajectories(filename=None):
     elif is_ipython:
         display.clear_output(wait=True)
         display.display(plt.gcf())
+
 
 def optimize_model():
     if len(memory) < BATCH_SIZE:
@@ -558,53 +541,150 @@ def optimize_model():
     torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
     optimizer.step()
 
-num_episodes = drone_spec['num_episodes']
 
-for i_episode in range(num_episodes):
+if __name__ == "__main__":
+    # --- COMMAND-LINE ARGUMENT & OUTPUT FOLDER SETUP ---
+    parser = argparse.ArgumentParser(description="UAV Wildfire Patrol Training Simulation")
+    parser.add_argument("-o", "--output_folder", type=str, default="photos", help="Local folder name to save output figures")
+    parser.add_argument("-d", "--drone", type=str, choices=["Heavy Duty", "All-In-One", "Explorer"], default="All-In-One", help="Selected drone model")
+    parser.add_argument("-e", "--episodes", type=int, default=300, help="Number of training episodes")
+    parser.add_argument("-w", "--weights_folder", type=str, default="weights",
+                        help="Folder to save Q-weights (kept separate from the output folder, which is cleared on every run)")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_folder)
+    if output_dir.exists():
+        # Clear existing files inside the folder
+        for item in output_dir.iterdir():
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                shutil.rmtree(item)
+    else:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    weights_dir = Path(args.weights_folder)
+    weights_dir.mkdir(parents=True, exist_ok=True)
+
+    # Launch configuration (via Streamlit command-line flags or fallback to interactive GUI)
+    if args.drone and args.episodes:
+        drone_spec = dict(DRONE_SPECS[args.drone])
+        drone_spec['num_episodes'] = max(100, min(6000, args.episodes))
+        print(f"Configuration Loaded -> Drone: {drone_spec['name']} | Max Steps: {drone_spec['max_steps']} | Radius: {drone_spec['discovery_radius']} | Episodes: {drone_spec['num_episodes']}")
+    else:
+        drone_spec = select_drone_model()
+
+    # set up matplotlib for training
+    is_ipython = 'inline' in matplotlib.get_backend()
+    if is_ipython:
+        from IPython import display
+
+    plt.ion()
+
+    env = AreaDiscoveryEnv(drone_spec)
+    n_actions = env.action_space.n
     state, info = env.reset()
-    state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
+    n_observations = len(state)
 
-    ep_reward = 0
-    for t in count():
-        action = select_action(state)
-        observation, reward, terminated, truncated, _ = env.step(action.item())
-        ep_reward += reward
-        reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
-        done = terminated or truncated
+    policy_net = DQN(n_observations, n_actions).to(device)
+    target_net = DQN(n_observations, n_actions).to(device)
+    target_net.load_state_dict(policy_net.state_dict())
 
-        if terminated:
-            next_state = None
-        else:
-            next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
+    optimizer = optim.AdamW(policy_net.parameters(), lr=LR, amsgrad=True)
+    memory = ReplayMemory(10000)
+    steps_done = 0
+    all_trajectories = []
+    episode_rewards = []
+    episode_found = []       # 1 if the fire was found that episode
+    episode_landed = []      # 1 if the flight ended with a landing
+    episode_recharges = []   # recharges used that episode
 
-        memory.push(state, action, next_state, reward_tensor)
-        state = next_state
+    best_path = weights_dir / weights_filename(drone_spec['name'], "best")
+    final_path = weights_dir / weights_filename(drone_spec['name'], "final")
+    best_avg_reward = -float('inf')
+    best_episode = None
 
-        optimize_model()
+    # Use the number of episodes specified by the user in the configuration window
+    num_episodes = drone_spec['num_episodes']
 
-        target_net_state_dict = target_net.state_dict()
-        policy_net_state_dict = policy_net.state_dict()
-        for key in policy_net_state_dict:
-            target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
-        target_net.load_state_dict(target_net_state_dict)
+    for i_episode in range(num_episodes):
+        state, info = env.reset()
+        state = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
 
-        if done:
-            all_trajectories.append(env.trajectory)
-            episode_rewards.append(ep_reward)
+        ep_reward = 0
+        for t in count():
+            action = select_action(state)
+            observation, reward, terminated, truncated, _ = env.step(action.item())
+            ep_reward += reward
+            reward_tensor = torch.tensor([reward], device=device, dtype=torch.float32)
+            done = terminated or truncated
 
-            if (i_episode + 1) % 20 == 0:
-                plot_trajectories(filename=f"trajectory_episode_{i_episode + 1}.png")
-            break
+            if terminated:
+                next_state = None
+            else:
+                next_state = torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
 
-print('Training Complete')
-plot_trajectories(filename="final_trajectory.png")
-plt.ioff()
+            memory.push(state, action, next_state, reward_tensor)
+            state = next_state
 
-plt.figure(figsize=(10, 4.5))
-plt.plot(episode_rewards)
-plt.title(f'Reward over Time ({drone_spec["name"]})')
-plt.xlabel('Episode')
-plt.ylabel('Total Reward')
-plt.grid(True, linestyle='--', alpha=0.3)
-plt.savefig(output_dir / "reward_over_time.png", bbox_inches='tight')
-plt.close()                                   
+            optimize_model()
+
+            target_net_state_dict = target_net.state_dict()
+            policy_net_state_dict = policy_net.state_dict()
+            for key in policy_net_state_dict:
+                target_net_state_dict[key] = policy_net_state_dict[key]*TAU + target_net_state_dict[key]*(1-TAU)
+            target_net.load_state_dict(target_net_state_dict)
+
+            if done:
+                all_trajectories.append(env.trajectory)
+                episode_rewards.append(ep_reward)
+                episode_found.append(int(env.fire_scouted))
+                episode_landed.append(int(env.landed))
+                episode_recharges.append(env.recharges_used)
+
+                # --- Best-weights checkpointing (rolling average) ---
+                if len(episode_rewards) >= BEST_WINDOW:
+                    rolling_avg = float(np.mean(episode_rewards[-BEST_WINDOW:]))
+                    if rolling_avg > best_avg_reward:
+                        best_avg_reward = rolling_avg
+                        best_episode = i_episode + 1
+                        save_checkpoint(best_path, policy_net, best_episode, best_avg_reward)
+
+                if (i_episode + 1) % 20 == 0:
+                    plot_trajectories(filename=f"trajectory_episode_{i_episode + 1}.png")
+
+                if (i_episode + 1) % 100 == 0:
+                    print(f"Episode {i_episode + 1:>5} | avg reward {np.mean(episode_rewards[-100:]):9.1f} | "
+                          f"fire found {100 * np.mean(episode_found[-100:]):5.1f}% | "
+                          f"ended with landing {100 * np.mean(episode_landed[-100:]):5.1f}% | "
+                          f"avg recharges {np.mean(episode_recharges[-100:]):.2f}", flush=True)
+                break
+
+    print('Training Complete')
+
+    # Always save the final weights too, for comparison with the best checkpoint
+    final_avg = float(np.mean(episode_rewards[-BEST_WINDOW:])) if episode_rewards else 0.0
+    save_checkpoint(final_path, policy_net, num_episodes, final_avg)
+    if best_episode is not None:
+        print(f"Best Q-weights saved -> {best_path} (episode {best_episode}, "
+              f"{BEST_WINDOW}-episode avg reward {best_avg_reward:.1f})")
+    print(f"Final Q-weights saved -> {final_path}")
+
+    plot_trajectories(filename="final_trajectory.png")
+    plt.ioff()
+
+    plt.figure(figsize=(10, 4.5))
+    plt.plot(episode_rewards, alpha=0.5, label='Episode reward')
+    if len(episode_rewards) >= BEST_WINDOW:
+        rolling = np.convolve(episode_rewards, np.ones(BEST_WINDOW) / BEST_WINDOW, mode='valid')
+        plt.plot(range(BEST_WINDOW - 1, len(episode_rewards)), rolling, color='black',
+                 linewidth=2, label=f'{BEST_WINDOW}-episode average')
+    if best_episode is not None:
+        plt.axvline(best_episode - 1, color='green', linestyle='--', label=f'Best weights (ep {best_episode})')
+    plt.title(f'Reward over Time ({drone_spec["name"]})')
+    plt.xlabel('Episode')
+    plt.ylabel('Total Reward')
+    plt.legend(fontsize=8)
+    plt.grid(True, linestyle='--', alpha=0.3)
+    plt.savefig(output_dir / "reward_over_time.png", bbox_inches='tight')
+    plt.close()

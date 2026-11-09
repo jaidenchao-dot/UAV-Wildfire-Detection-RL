@@ -2,7 +2,8 @@
 """Streamlit GUI Runner for UAV Wildfire Patrol Simulation (test mode)
 
 Runs pre-trained Q-weights (no training) through seeded test scenarios using
-test_q_weights.py. The weights file used always matches the selected drone.
+test_q_weights_v2.py, which uses the current v3_uav_wildfires.py environment
+(with recharges). The weights file used always matches the selected drone.
 
 A second tab displays the final research paper, including the figures
 embedded in the markdown file and a local dashboard screenshot.
@@ -33,7 +34,7 @@ DRONES = {
 
 
 def weights_filename(drone_name, kind="best"):
-    """Must match the naming used by v2_uav_wildfires.py."""
+    """Must match the naming used by v3_uav_wildfires.py."""
     return f"{kind}_q_weights_{drone_name.replace(' ', '_')}.pt"
 
 
@@ -76,6 +77,25 @@ def load_paper(path_str, mtime):
             parts.append(("image", piece))
 
     return parts, images, bool(replaced)
+
+
+@st.cache_data
+def read_checkpoint_info(path_str, mtime):
+    """Return (n_observations, obs_version) stored in a weights file.
+
+    Weights from the old v2_uav_wildfires.py have no obs_version. `mtime` only
+    refreshes the cache when the file changes.
+    """
+    import torch
+    ckpt = torch.load(path_str, map_location="cpu", weights_only=True)
+    return ckpt.get("n_observations"), ckpt.get("obs_version")
+
+
+@st.cache_resource
+def current_obs_version():
+    """Observation version of the current environment (v3_uav_wildfires.py)."""
+    from v3_uav_wildfires import OBS_VERSION
+    return OBS_VERSION
 
 
 def render_paper():
@@ -150,7 +170,7 @@ weights_kind = st.sidebar.radio(
 weights_folder = st.sidebar.text_input(
     "Weights Folder",
     value="weights",
-    help="Folder containing the .pt files saved by v2_uav_wildfires.py."
+    help="Folder containing the .pt files saved by v3_uav_wildfires.py."
 )
 
 num_cases = st.sidebar.slider(
@@ -177,15 +197,25 @@ output_folder = st.sidebar.text_input(
 
 # Weights file matching the selected drone
 weights_path = Path(weights_folder) / weights_filename(drone_model, weights_kind)
-if weights_path.exists():
-    st.sidebar.success(f"Using `{weights_path}`")
+retrain_cmd = f"`python v3_uav_wildfires.py -d \"{drone_model}\"`"
+weights_ok = False
+if not weights_path.exists():
+    st.sidebar.error(f"`{weights_path}` not found. Train this drone first:\n\n{retrain_cmd}")
 else:
-    st.sidebar.error(
-        f"`{weights_path}` not found. Train this drone first:\n\n"
-        f"`python v2_uav_wildfires.py -d \"{drone_model}\"`"
-    )
+    try:
+        n_obs, obs_version = read_checkpoint_info(str(weights_path), weights_path.stat().st_mtime)
+        if obs_version == current_obs_version():
+            weights_ok = True
+            st.sidebar.success(f"Using `{weights_path}` (v3, {n_obs} inputs, with recharges)")
+        else:
+            st.sidebar.error(
+                f"`{weights_path}` was trained with the old v2 environment "
+                f"({n_obs} inputs, no recharges). Retrain it with v3:\n\n{retrain_cmd}"
+            )
+    except Exception as e:
+        st.sidebar.error(f"Could not read `{weights_path}`: {e}")
 
-run_clicked = st.sidebar.button("🚀 Run Test", type="primary", disabled=not weights_path.exists())
+run_clicked = st.sidebar.button("🚀 Run Test", type="primary", disabled=not weights_ok)
 
 tab_test, tab_paper = st.tabs(["🚁 Test Dashboard", "📄 Research Paper"])
 
@@ -199,7 +229,7 @@ with tab_test:
     if run_clicked:
         with st.spinner(f"Running {num_cases} test case(s) with the {drone_model} drone..."):
             cmd = [
-                sys.executable, "test_q_weights.py",
+                sys.executable, str(BASE_DIR / "test_q_weights_v2.py"),
                 "--weights", str(weights_path),
                 "--cases", str(num_cases),
                 "--seed", str(int(seed)),
